@@ -1,7 +1,10 @@
 
 /**
+* Sources from:
+* 1- http://www.gamedev.net/topic/624876-how-to-read-an-audio-file-with-ffmpeg-in-c/
+* 2- http://stackoverflow.com/questions/9799560/decode-audio-using-libavcodec-and-play-using-libao 
 * compile with 
-* g++ tutoaudio.c -o test  $(pkg-config --cflags --libs libavformat libavcodec libswresample libswscale libavutil)
+* g++ tutoaudio.c -o tutoaudio $(pkg-config --cflags --libs ao libavformat libavcodec libswresample libswscale libavutil)
 */
 
 #include <iostream>
@@ -11,6 +14,7 @@ extern "C"
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
+#include <ao/ao.h>
 };
 #define nullptr NULL 
 
@@ -56,6 +60,8 @@ void printAudioFrameInfo(const AVCodecContext* codecContext, const AVFrame* fram
               << "frame->data[0]/frame->extended_data[0] (kind of like how some\n"
               << "image formats have RGB pixels packed together, rather than storing\n"
               << " the red, green, and blue channels separately in different arrays.\n";
+
+	std::cout<<"----------------------------------------------------------"<<std::endl;
 }
 
 int main()
@@ -73,7 +79,7 @@ int main()
     // you can change the file name "01 Push Me to the Floor.wav" to whatever the file is you're reading, like "myFile.ogg" or
     // "someFile.webm" and this should still work
     AVFormatContext* formatContext = NULL;
-    if (avformat_open_input(&formatContext, "../CarBots Marines vs. Zerglings-WKvX3a2J86s.mp4", NULL, NULL) != 0)
+    if (avformat_open_input(&formatContext, "01 - Wake Up.wav", NULL, NULL) != 0)
     {
         av_free(frame);
         std::cout << "Error opening the file" << std::endl;
@@ -111,6 +117,32 @@ int main()
         return 1;
     }
 
+ //initialize AO lib
+    ao_initialize();
+
+    int driver=ao_default_driver_id();
+    ao_sample_format sformat;
+	AVSampleFormat sfmt=codecContext->sample_fmt;
+    if(sfmt==AV_SAMPLE_FMT_U8){
+        printf("U8\n");
+
+        sformat.bits=8;
+    }else if(sfmt==AV_SAMPLE_FMT_S16){
+        printf("S16\n");
+        sformat.bits=16;
+    }else if(sfmt==AV_SAMPLE_FMT_S32){
+        printf("S32\n");
+        sformat.bits=32;
+    }
+
+    sformat.channels=codecContext->channels;
+    sformat.rate=codecContext->sample_rate;
+    sformat.byte_format=AO_FMT_NATIVE;
+    sformat.matrix=0;
+
+	ao_device *adevice=ao_open_live(driver,&sformat,NULL);
+    //end of init AO LIB
+
     std::cout << "This stream has " << codecContext->channels << " channels and a sample rate of " << codecContext->sample_rate << "Hz" << std::endl;
     std::cout << "The data is in the format " << av_get_sample_fmt_name(codecContext->sample_fmt) << std::endl;
 
@@ -139,7 +171,9 @@ int main()
                     decodingPacket.data += result;
 
                     // We now have a fully decoded audio frame
-                    printAudioFrameInfo(codecContext, frame);
+		//printAudioFrameInfo(codecContext, frame);
+
+                ao_play(adevice, (char*)frame->extended_data[0],frame->linesize[0] );
                 }
                 else
                 {
@@ -164,6 +198,7 @@ int main()
         {
             // We now have a fully decoded audio frame
             printAudioFrameInfo(codecContext, frame);
+
         }
     }
 
@@ -171,4 +206,6 @@ int main()
     av_free(frame);
     avcodec_close(codecContext);
     avformat_close_input(&formatContext);
+    ao_shutdown();
+	return 0;
 }
