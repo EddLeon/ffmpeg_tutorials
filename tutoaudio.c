@@ -5,6 +5,8 @@
 * 2- http://stackoverflow.com/questions/9799560/decode-audio-using-libavcodec-and-play-using-libao 
 * compile with 
 * g++ tutoaudio.c -o tutoaudio $(pkg-config --cflags --libs ao libavformat libavcodec libswresample libswscale libavutil)
+* It currently only plays wma correctly
+* MP3 bitrate duration is wrong ...
 */
 
 #include <iostream>
@@ -64,8 +66,9 @@ void printAudioFrameInfo(const AVCodecContext* codecContext, const AVFrame* fram
 	std::cout<<"----------------------------------------------------------"<<std::endl;
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	const char* input_filename=argv[1];
     // Initialize FFmpeg
     av_register_all();
 
@@ -79,7 +82,7 @@ int main()
     // you can change the file name "01 Push Me to the Floor.wav" to whatever the file is you're reading, like "myFile.ogg" or
     // "someFile.webm" and this should still work
     AVFormatContext* formatContext = NULL;
-    if (avformat_open_input(&formatContext, "01 - Wake Up.wav", NULL, NULL) != 0)
+    if (avformat_open_input(&formatContext,input_filename , NULL, NULL) != 0) //input_filename
     {
         av_free(frame);
         std::cout << "Error opening the file" << std::endl;
@@ -127,7 +130,7 @@ int main()
         printf("U8\n");
 
         sformat.bits=8;
-    }else if(sfmt==AV_SAMPLE_FMT_S16){
+    }else if(sfmt==AV_SAMPLE_FMT_S16 || sfmt ==AV_SAMPLE_FMT_S16P){
         printf("S16\n");
         sformat.bits=16;
     }else if(sfmt==AV_SAMPLE_FMT_S32){
@@ -135,6 +138,8 @@ int main()
         sformat.bits=32;
     }
 
+
+    //sformat.bits = atoi(av_get_sample_fmt_name(codecContext->sample_fmt));
     sformat.channels=codecContext->channels;
     sformat.rate=codecContext->sample_rate;
     sformat.byte_format=AO_FMT_NATIVE;
