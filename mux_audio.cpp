@@ -563,6 +563,7 @@ void get_audio_frame(OutputStream *ost, InputStream *ist, int *finished)
 	AVPacket readingPacket;
     av_init_packet(&readingPacket);
 	int error;
+	int gotFrame;
     // Read the packets in a loop
     if (error = av_read_frame(ist->formatContext, &readingPacket) == 0)
     {
@@ -576,7 +577,7 @@ void get_audio_frame(OutputStream *ost, InputStream *ist, int *finished)
                 // Try to decode the packet into a frame
                 // Some frames rely on multiple packets, so we have to make sure the frame is finished before
                 // we can use it
-                int gotFrame = 0;
+                gotFrame=0;
                 int result = avcodec_decode_audio4(ist->codecContext, frame, &gotFrame, &decodingPacket);
 
                 if (result >= 0 && gotFrame)
@@ -588,6 +589,7 @@ void get_audio_frame(OutputStream *ost, InputStream *ist, int *finished)
 		//printAudioFrameInfo(codecContext, frame);
 				std::cout<<"GOT FRAME"<<std::endl;
                 //ao_play(adevice, (char*)ist->frame->extended_data[0],ist->frame->linesize[0] );
+				goto done;
                 }
                 else
                 {
@@ -606,17 +608,18 @@ void get_audio_frame(OutputStream *ost, InputStream *ist, int *finished)
             *finished = 1;
         else {
             printf("Could not read frame (error '%s')\n",NULL);//get_error_text(error));
+			 *finished = 1;
             return;
         }
 	}
-
+    
+	gotFrame = 0;
     // Some codecs will cause frames to be buffered up in the decoding process. If the CODEC_CAP_DELAY flag
     // is set, there can be buffered up frames that need to be flushed, so we'll do that
     if (ist->codecContext->codec->capabilities & CODEC_CAP_DELAY)
     {
         av_init_packet(&readingPacket);
         // Decode all the remaining frames in the buffer, until the end is reached
-        int gotFrame = 0;
         while (avcodec_decode_audio4(ist->codecContext, frame, &gotFrame, &readingPacket) >= 0 && gotFrame)
         {
             // We now have a fully decoded audio frame
@@ -624,6 +627,12 @@ void get_audio_frame(OutputStream *ost, InputStream *ist, int *finished)
 
         }
     }
+	
+	done:
+	if (*finished && gotFrame)
+        *finished = 0;
+    av_packet_unref(&readingPacket);
+	
 	std::cout<<"returning frame"<<std::endl;
 		
 	frame->pts = ost->next_pts;
@@ -633,117 +642,188 @@ void get_audio_frame(OutputStream *ost, InputStream *ist, int *finished)
 	
 }
 
+/** Initialize one data packet for reading or writing. */
+static void init_packet(AVPacket *packet)
+{
+    av_init_packet(packet);
+    /** Set the packet data and size so that it is recognized as being empty. */
+    packet->data = NULL;
+    packet->size = 0;
+}
+
+/** Decode one audio frame from the input file. */
+static int decode_audio_frame(AVFrame *frame,
+                              AVFormatContext *input_format_context,
+                              AVCodecContext *input_codec_context,
+                              int *data_present, int *finished,int streamIndex, OutputStream *ost)
+{							  
+    /** Packet used for temporary storage. */
+    AVPacket input_packet;
+    int error;
+    init_packet(&input_packet);
+    /** Read one audio frame from the input file into a temporary packet. */
+    if ((error = av_read_frame(input_format_context, &input_packet)) < 0) {
+        /** If we are at the end of the file, flush the decoder below. */
+        if (error == AVERROR_EOF)
+            *finished = 1;
+        else {
+            fprintf(stderr, "Could not read frame (error '%s')\n",NULL);//get_error_text(error));
+            return error;
+        }
+    }
+	 if (input_packet.stream_index != streamIndex){
+		 *data_present = 0;
+			return error;
+	 }
+    /**
+     * Decode the audio frame stored in the temporary packet.
+     * The input audio stream decoder is used to do this.
+     * If we are at the end of the file, pass an empty packet to the decoder
+     * to flush it.
+     */
+	AVPacket decodingPacket = input_packet;
+   /* if ((error = avcodec_decode_audio4(input_codec_context, frame,
+                                       data_present, &input_packet)) < 0) {
+        fprintf(stderr, "Could not decode frame (error '%s')\n",NULL);//get_error_text(error));
+        av_packet_unref(&input_packet);
+        return error;
+    }
+	else{
+		if(data_present){
+			decodingPacket.size -= result;
+            decodingPacket.data += result;
+		}
+	}*/
+	
+	 // Audio packets can have multiple audio frames in a single packet
+            while (decodingPacket.size > 0)
+            {
+                // Try to decode the packet into a frame
+                // Some frames rely on multiple packets, so we have to make sure the frame is finished before
+                // we can use it
+                int gotFrame = 0;
+                int result = avcodec_decode_audio4(input_codec_context, frame, data_present, &decodingPacket);
+
+                if (result >= 0 && data_present)
+                {
+                    decodingPacket.size -= result;
+                    decodingPacket.data += result;
+
+                    // We now have a fully decoded audio frame
+		//printAudioFrameInfo(codecContext, frame);
+				std::cout<<"GOT FRAME"<<std::endl;
+				
+				ost->next_pts  += frame->nb_samples;
+				
+                //ao_play(adevice, (char*)frame->extended_data[0],frame->linesize[0] );
+                }
+                else
+                {
+					fprintf(stderr, "Could not decode frame (error '%s')\n",NULL);//get_error_text(error));
+					av_packet_unref(&input_packet);
+                    decodingPacket.size = 0;
+                    decodingPacket.data = NULL;
+					return result;
+                }
+            }
+			av_free_packet(&input_packet);
+
+    /**
+     * If the decoder has not been flushed completely, we are not finished,
+     * so that this function has to be called again.
+     */
+    if (*finished && *data_present)
+        *finished = 0;
+    av_packet_unref(&input_packet);
+    return 0;
+}
+
 /*
  * encode one audio frame and send it to the muxer
  * return 1 when encoding is finished, 0 otherwise
  */
-static int read_decode_convert_and_store(AVFormatContext *oc, OutputStream *ost, InputStream *ist, AVAudioFifo *fifo, int *finished)
-{
-    AVCodecContext *c;
-    AVPacket pkt = { 0 }; // data and size must be 0;
+static int read_decode_convert_and_store(AVFormatContext *oc, OutputStream *ost, InputStream *ist, AVAudioFifo *fifo, int *finished){
+    //AVPacket pkt = { 0 }; // data and size must be 0;
     AVFrame *frame=NULL;
-    int ret;
-    int got_packet;
     int dst_nb_samples;
 	uint8_t **converted_input_samples = NULL;
+    int data_present;
+    int ret = AVERROR_EXIT;
 
-    av_init_packet(&pkt);
-	c = ost->enc;
+   // av_init_packet(&pkt);
+	//c = ost->enc;
     //c = ist->codecContext;
 
-    get_audio_frame(ost,ist, finished);
+    //get_audio_frame(ost,ist, finished);
+	
+	 /* check if we want to generate more frames */
+    /*if (av_compare_ts(ost->next_pts, ost->enc->time_base,
+                      STREAM_DURATION, (AVRational){ 1, 1 }) >= 0)
+        return NULL;*/
+	
+	/** Decode one frame worth of audio samples. */
+    if (decode_audio_frame(ist->frame, ist->formatContext,
+                           ist->codecContext, &data_present, finished, ist->audioStream->index, ost))
+					goto cleanup;
+	
 	frame = ist->frame;
 	
-    if (*finished && frame!=NULL) {
+	/**
+     * If we are at the end of the file and there are no more samples
+     * in the decoder which are delayed, we are actually finished.
+     * This must not be treated as an error.
+     */
+    if (*finished && !data_present) {
+        ret = 0;
+        goto cleanup;
+    }
+	
+    if (data_present) {
 		
-		                printf("GOT FRAME\n");
-		/*
-        //convert samples from native format to destination codec format, using the resampler 
-            // compute destination number of samples 
-            dst_nb_samples = av_rescale_rnd(swr_get_delay(ost->swr_ctx, c->sample_rate) + frame->nb_samples,
-                                            c->sample_rate, c->sample_rate, AV_ROUND_UP);
-            av_assert0(dst_nb_samples == frame->nb_samples);
-
-					                printf("RESCALE SUCCEDED\n");
-
-			
-        // when we pass a frame to the encoder, it may keep a reference to it
-         // internally;
-         //*make sure we do not overwrite it here
-         //
-        ret = av_frame_make_writable(ost->frame);
-        if (ret < 0)
-            exit(1);
-					                printf("MAKE WRITABLE SUCCEDED\n");
-
+		//frame->pts = ost->next_pts;
+		//ost->next_pts  += frame->nb_samples;
 		
-            // convert to destination format 
-            ret = swr_convert(ost->swr_ctx,
-                              ost->frame->data, dst_nb_samples,
-                              (const uint8_t **)frame->data, frame->nb_samples);
-            if (ret < 0) {
-                fprintf(stderr, "Error while converting\n");
-                exit(1);
-            }
-            frame = ost->frame;
-
-								                printf("swr_convert SUCCEDED\n");
-
-			
-        frame->pts = av_rescale_q(ost->samples_count, (AVRational){1, c->sample_rate}, c->time_base);
-        ost->samples_count += dst_nb_samples;
-		
-										                printf("av_rescale_q SUCCEDED\n");
-
-		*/
-		
+		                printf("DATA PRESENT\n");
 		/** Initialize the temporary storage for the converted input samples. */
 		 if (init_converted_samples(&converted_input_samples, ost->enc,
-                                   frame->nb_samples))
-			 printf("init_converted_samples FAILED\n");
+                                   frame->nb_samples)){
+								   printf("init_converted_samples FAILED\n");
+								    goto cleanup;
+									}
+		                printf("DP1\n");
 
 		/**
          * Convert the input samples to the desired output sample format.
          * This requires a temporary storage provided by converted_input_samples.
          */
         if (convert_samples((const uint8_t**)frame->extended_data, converted_input_samples,
-                            frame->nb_samples, ost->swr_ctx))
-										 printf("convert_samples FAILED\n");
-
+                            frame->nb_samples, ost->swr_ctx)){
+								printf("convert_samples FAILED\n");
+								goto cleanup;								
+							}
+printf("DP2\n");
 		/** Add the converted input samples to the FIFO buffer for later processing. */
         if (add_samples_to_fifo(fifo, converted_input_samples,
                                 frame->nb_samples))
+								 goto cleanup;
+		ret=0;
+
+
+		//av_frame_free(&frame);
 		
+	}
+	printf("DP3\n");
+	cleanup:
 		 if (converted_input_samples) {
+			 	printf("DP3.1\n");
 			av_freep(&converted_input_samples[0]);
+				printf("DP3.2\n");
 			free(converted_input_samples);
+				printf("DP3.3\n");
 		}
-		av_frame_free(&frame);
-    }
-
-	
-	/*
-    ret = avcodec_encode_audio2(c, &pkt, frame, &got_packet);
-    if (ret < 0) {
-        fprintf(stderr, "Error encoding audio frame: %s\n");//, av_err2str(ret));
-        exit(1);
-    }
-											                printf("avcodec_encode_audio2 SUCCEDED\n");
-
-
-    if (got_packet) {
-        ret = write_frame(oc, &c->time_base, ost->st, &pkt);
-        if (ret < 0) {
-            fprintf(stderr, "Error while writing audio frame: %s\n");//,av_err2str(ret));
-            exit(1);
-        }
-    }
-												                printf("write_frame SUCCEDED\n");
-
-	*/
-    return (frame || got_packet) ? 0 : 1;
+		printf("DP4\n");
+		return ret;
 }
-
 /**************************************************************/
 /* video output */
 
@@ -912,7 +992,7 @@ static int write_video_frame(AVFormatContext *oc, OutputStream *ost)
     }
 
     if (ret < 0) {
-        fprintf(stderr, "Error while writing video frame: %s\n");//, av_err2str(ret));
+        fprintf(stderr,"Error while writing video frame: %x\n",ret);//, av_err2str(ret));
         exit(1);
     }
 
@@ -1036,6 +1116,50 @@ static int load_encode_and_write(AVAudioFifo *fifo,
     return 0;
 }
 
+/**
+ * Initialize the audio resampler based on the input and output codec settings.
+ * If the input and output sample formats differ, a conversion is required
+ * libswresample takes care of this, but requires initialization.
+ */
+static int init_resampler(AVCodecContext *input_codec_context,
+                          AVCodecContext *output_codec_context,
+                          SwrContext **resample_context)
+{
+        int error;
+        /**
+         * Create a resampler context for the conversion.
+         * Set the conversion parameters.
+         * Default channel layouts based on the number of channels
+         * are assumed for simplicity (they are sometimes not detected
+         * properly by the demuxer and/or decoder).
+         */
+        *resample_context = swr_alloc_set_opts(NULL,
+                                              av_get_default_channel_layout(output_codec_context->channels),
+                                              output_codec_context->sample_fmt,
+                                              output_codec_context->sample_rate,
+                                              av_get_default_channel_layout(input_codec_context->channels),
+                                              input_codec_context->sample_fmt,
+                                              input_codec_context->sample_rate,
+                                              0, NULL);
+        if (!*resample_context) {
+            fprintf(stderr, "Could not allocate resample context\n");
+            return AVERROR(ENOMEM);
+        }
+        /**
+        * Perform a sanity check so that the number of converted samples is
+        * not greater than the number of samples to be converted.
+        * If the sample rates differ, this case has to be handled differently
+        */
+        av_assert0(output_codec_context->sample_rate == input_codec_context->sample_rate);
+        /** Open the resampler with the specified parameters. */
+        if ((error = swr_init(*resample_context)) < 0) {
+            fprintf(stderr, "Could not open resample context\n");
+            swr_free(resample_context);
+            return error;
+        }
+    return 0;
+}
+
 static void close_stream(AVFormatContext *oc, OutputStream *ost)
 {
     avcodec_free_context(&ost->enc);
@@ -1128,18 +1252,11 @@ int main(int argc, char **argv)
         }
     }
 
-    /* Write the stream header, if any. */
-    ret = avformat_write_header(oc, &opt);
-    if (ret < 0) {
-        fprintf(stderr, "Error occurred when opening output file: %s\n");//,av_err2str(ret));
-        return 1;
-    }
-
 	/*opening audio to mux*/
 	open_audio_input(&audio_in, &audio_st);
 	
-	/*if (init_resampler(input_codec_context, output_codec_context,
-                       &resample_context)){
+	/*if (init_resampler(audio_in.codecContext, audio_st.enc,
+                       &audio_st.swr_ctx)){
 		fprintf(stderr, "Could initialize resampler\n");//, av_err2str(ret));
 		return 1;
 	}*/
@@ -1148,14 +1265,23 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	
+	/* Write the stream header, if any. */
+    ret = avformat_write_header(oc, &opt);
+    if (ret < 0) {
+        fprintf(stderr, "Error occurred when opening output file: %s\n");//,av_err2str(ret));
+        return 1;
+    }
+	
     while (encode_video || encode_audio) {
 		const int output_frame_size = audio_st.enc->frame_size;
         /* select the stream to encode */
-        if (encode_video &&
-            (!encode_audio || av_compare_ts(video_st.next_pts, video_st.enc->time_base,
-                                            audio_st.next_pts, audio_st.enc->time_base) <= 0)) {
+        if (encode_video ) //&&(!encode_audio || av_compare_ts(video_st.next_pts, video_st.enc->time_base,audio_st.next_pts, audio_st.enc->time_base) <= 0)
+		{
             encode_video = !write_video_frame(oc, &video_st);
+						 printf("write video frame\n");
+						 //encode_audio=1;
         } else {
+			break;
 			int finished = 0;
 			
 			/**
@@ -1178,6 +1304,7 @@ int main(int argc, char **argv)
 				if (finished)
 					break;
 			 }
+			 printf("read_decode_convert_and_store\n");
 			 /**
 			 * If we have enough samples for the encoder, we encode them.
 			 * At the end of the file, we pass the remaining samples to
@@ -1191,12 +1318,15 @@ int main(int argc, char **argv)
 				 */
 				if (load_encode_and_write(fifo, oc, audio_st.enc))
 					goto cleanup;
+				
+				printf("load_encode_and_write\n");
             
 			/**
 			 * If we are at the end of the input file and have encoded
 			 * all remaining samples, we can exit this loop and finish.
 			 */
 			if (finished) {
+							printf("finished\n");
 				int data_written;
 				/** Flush the encoder as it may have delayed frames. */
 				do {
@@ -1206,6 +1336,7 @@ int main(int argc, char **argv)
 				} while (data_written);
 				break;
 			}
+			printf("encode_audio_frame\n");
 		}
     }
 
@@ -1231,6 +1362,8 @@ int main(int argc, char **argv)
 	
 	/*free ist*/
 	close_audio_input(&audio_in);
+	if (fifo)
+        av_audio_fifo_free(fifo);
 
     return 0;
 }
