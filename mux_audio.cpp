@@ -53,13 +53,15 @@ extern "C"
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
+#include <ao/ao.h>
 }
 #define STREAM_DURATION   10.0
 #define STREAM_FRAME_RATE 25 /* 25 images/s */
 #define STREAM_PIX_FMT    AV_PIX_FMT_YUV420P /* default pix_fmt */
 
 #define SCALE_FLAGS SWS_BICUBIC
-
+ao_device *adevice;
+ao_sample_format sformat;
 using namespace std;
 
 // a wrapper around a single output AVStream
@@ -153,21 +155,21 @@ static int convert_samples(const uint8_t **input_data,
 	
 	/* convert samples from native format to destination codec format, using the resampler */
 	/* compute destination number of samples */
-   dst_nb_samples = av_rescale_rnd(swr_get_delay(resample_context, ost->enc->sample_rate) +  frame->nb_samples,
+   /*dst_nb_samples = av_rescale_rnd(swr_get_delay(resample_context, ost->enc->sample_rate) +  frame->nb_samples,
 									ost->enc->sample_rate, ost->enc->sample_rate, AV_ROUND_UP);
-	av_assert0(dst_nb_samples ==  frame->nb_samples);
+	av_assert0(dst_nb_samples ==  frame->nb_samples);*/
 	
     /** Convert the samples using the resampler. */
     if ((error = swr_convert(resample_context,
                              converted_data, frame_size,
-                             input_data    ,  frame->nb_samples)) < 0) {
+                             input_data    ,  frame_size)) < 0) {
         fprintf(stderr, "Could not convert input samples (error '%s')\n",NULL);//get_error_text(error));
         return error;
     }
 	
-	frame->pts = dst_nb_samples;//av_rescale_q(ost->samples_count, (AVRational){1, ost->enc->sample_rate}, ost->enc->time_base);
+	/*frame->pts = dst_nb_samples;//av_rescale_q(ost->samples_count, (AVRational){1, ost->enc->sample_rate}, ost->enc->time_base);
     ost->samples_count += dst_nb_samples;
-	ost->next_pts  += frame->nb_samples;
+	ost->next_pts  += frame->nb_samples;*/	
     return 0;
 }
 /** Add converted input audio samples to the FIFO buffer for later processing. */
@@ -650,7 +652,6 @@ void get_audio_frame(OutputStream *ost, InputStream *ist, int *finished)
 		
 	frame->pts = ost->next_pts;
 	ost->next_pts  += frame->nb_samples;
-
 	//return frame;
 	
 }
@@ -674,6 +675,12 @@ static int decode_audio_frame(AVFrame *frame,
     AVPacket input_packet;
     int error;
     init_packet(&input_packet);
+	
+	/*///check if we want to generate more frames 
+    if (av_compare_ts(ost->next_pts,  ost->enc->time_base,
+                      STREAM_DURATION, (AVRational){ 1, 1 }) >= 0)
+        return NULL;*/
+	
     /** Read one audio frame from the input file into a temporary packet. */
     if ((error = av_read_frame(input_format_context, &input_packet)) < 0) {
         /** If we are at the end of the file, flush the decoder below. */
@@ -726,7 +733,6 @@ static int decode_audio_frame(AVFrame *frame,
 		//printAudioFrameInfo(codecContext, frame);
 				std::cout<<"DECODED FRAME"<<std::endl;
 				
-				//ost->next_pts  += frame->nb_samples;
 				
                 //ao_play(adevice, (char*)frame->extended_data[0],frame->linesize[0] );
                 }
@@ -770,9 +776,11 @@ static int read_decode_convert_and_store(AVFormatContext *oc, OutputStream *ost,
     //get_audio_frame(ost,ist, finished);
 	
 	 /* check if we want to generate more frames */
-    /*if (av_compare_ts(ost->next_pts, ost->enc->time_base,
-                      STREAM_DURATION, (AVRational){ 1, 1 }) >= 0)
-        return NULL;*/
+    if (av_compare_ts(ost->next_pts, ost->enc->time_base,
+                      STREAM_DURATION, (AVRational){ 1, 1 }) >= 0){
+		*finished =  1;
+		goto cleanup;
+	}
 	
 	/** Decode one frame worth of audio samples. */
     if (decode_audio_frame(ist->frame, ist->formatContext,
@@ -780,7 +788,8 @@ static int read_decode_convert_and_store(AVFormatContext *oc, OutputStream *ost,
 					goto cleanup;
 	
 	frame = ist->frame;
-	
+	ao_play(adevice, (char*)frame->extended_data[0],frame->linesize[0] );
+
 	//frame->pts = ost->next_pts;
     //ost->next_pts  += frame->nb_samples;
 	
@@ -838,7 +847,7 @@ printf("DP2\n");
 				printf("DP3.3\n");
 		}
 		printf("DP4\n");
-		return ret;
+		return (frame || data_present) ? 0 : 1;
 }
 /**************************************************************/
 /* video output */
@@ -972,7 +981,7 @@ static AVFrame *get_video_frame(OutputStream *ost)
     }
 
     ost->frame->pts = ost->next_pts++;
-
+    printf("video ost->next_pts :%i\n",ost->next_pts);
     return ost->frame;
 }
 
@@ -998,19 +1007,27 @@ static int write_video_frame(AVFormatContext *oc, OutputStream *ost)
     ret = avcodec_encode_video2(c, &pkt, frame, &got_packet);
     if (ret < 0) {
         fprintf(stderr, "Error encoding video frame: %s\n");//, av_err2str(ret));
+			    printf("Error encoding video frame\n");
+
         exit(1);
     }
+	    printf("avcodec_encode_video2\n");
+
 
     if (got_packet) {
         ret = write_frame(oc, &c->time_base, ost->st, &pkt);
+		printf("video write_frame\n");
     } else {
         ret = 0;
+		printf("video write_frame failed\n");
     }
 
     if (ret < 0) {
         fprintf(stderr,"Error while writing video frame: %x\n",ret);//, av_err2str(ret));
         exit(1);
     }
+
+			printf("finished write_video_frame\n");
 
     return (frame || got_packet) ? 0 : 1;
 }
@@ -1065,11 +1082,23 @@ static int encode_audio_frame(AVFrame *frame,
     av_init_packet(&output_packet);
 	output_packet.data = NULL;
     output_packet.size = 0;
+	
+	    int dst_nb_samples;
 
     /** Set a timestamp based on the sample rate for the container. */
     if (frame) {
         frame->pts = pts;
         pts += frame->nb_samples;
+		
+		ost->samples_count +=  frame->nb_samples;
+		ost->next_pts  = pts;//= frame->nb_samples;
+				printf("audio ost->next_pts :%i\n",ost->next_pts);
+		/*dst_nb_samples = av_rescale_rnd(swr_get_delay(ost->swr_ctx, ost->enc->sample_rate) +  frame->nb_samples,
+									ost->enc->sample_rate, ost->enc->sample_rate, AV_ROUND_UP);
+	    av_assert0(dst_nb_samples ==  frame->nb_samples);
+		frame->pts = dst_nb_samples;
+		ost->samples_count +=  frame->pts;
+	    ost->next_pts  += frame->nb_samples;*/
     }
     /**
      * Encode the audio frame and store it in the temporary packet.
@@ -1083,11 +1112,16 @@ static int encode_audio_frame(AVFrame *frame,
     }
     /** Write one audio frame from the temporary packet to the output file. */
     if (*data_present) {
-        if ((error = av_write_frame(output_format_context, &output_packet)) < 0) {
+        /*if ((error = av_write_frame(output_format_context, &output_packet)) < 0) {
             fprintf(stderr, "Could not write frame (error '%s')\n",NULL);//get_error_text(error));
             av_packet_unref(&output_packet);
             return error;
-        }
+        }*/
+		if(error = write_frame(output_format_context,&ost->enc->time_base, ost->st, &output_packet)<0){
+            fprintf(stderr, "Could not write frame (error '%i')\n",error);//get_error_text(error));
+            av_packet_unref(&output_packet);
+			return error;
+		}
         av_packet_unref(&output_packet);
     }
     return 0;
@@ -1179,6 +1213,37 @@ static int init_resampler(AVCodecContext *input_codec_context,
             return error;
         }
     return 0;
+}
+
+void aoLibInit(InputStream *ost){
+  //initialize AO lib
+    ao_initialize();
+
+    int driver=ao_default_driver_id();
+	AVSampleFormat sfmt=ost->codecContext->sample_fmt;
+    if(sfmt==AV_SAMPLE_FMT_U8){
+        printf("U8\n");
+
+        sformat.bits=8;
+    }else if(sfmt==AV_SAMPLE_FMT_S16 || sfmt ==AV_SAMPLE_FMT_S16P){
+        printf("S16\n");
+        sformat.bits=16;
+    }else if(sfmt==AV_SAMPLE_FMT_S32){
+        printf("S32\n");
+        sformat.bits=32;
+    }
+
+
+    //sformat.bits = atoi(av_get_sample_fmt_name(codecContext->sample_fmt));
+    sformat.channels=ost->codecContext->channels;
+    sformat.rate=ost->codecContext->sample_rate;
+    sformat.byte_format=AO_FMT_NATIVE;
+    sformat.matrix=0;
+
+	adevice=ao_open_live(driver,&sformat,NULL);
+	std::cout << "FInished ao init" << std::endl;
+
+    //end of init AO LIB
 }
 
 static void close_stream(AVFormatContext *oc, OutputStream *ost)
@@ -1275,6 +1340,9 @@ int main(int argc, char **argv)
 
 	/*opening audio to mux*/
 	open_audio_input(&audio_in, &audio_st);
+	aoLibInit(&audio_in);
+
+	
 	
 	/*if (init_resampler(audio_in.codecContext, audio_st.enc,
                        &audio_st.swr_ctx)){
@@ -1301,7 +1369,7 @@ int main(int argc, char **argv)
             encode_video = !write_video_frame(oc, &video_st);
 						 printf("write video frame\n");
 						 //encode_audio=1;
-        } else  if(encode_audio && av_compare_ts(audio_st.next_pts, audio_st.enc->time_base, video_st.next_pts, video_st.enc->time_base) <= 0){
+        } else{// if(!encode_audio && av_compare_ts(audio_st.next_pts, audio_st.enc->time_base, video_st.next_pts, video_st.enc->time_base) <= 0){
 			//break;
 			int finished = 0;
 			
@@ -1312,7 +1380,7 @@ int main(int argc, char **argv)
 			 * need to FIFO buffer to store as many frames worth of input samples
 			 * that they make up at least one frame worth of output samples.
 			 */
-			 while (av_audio_fifo_size(fifo) < output_frame_size) {
+			 while (av_audio_fifo_size(fifo) < output_frame_size ) {
 				  /**
 				 * Decode one frame worth of audio samples, convert it to the
 				 * output sample format and put it into the FIFO buffer.
@@ -1391,5 +1459,7 @@ int main(int argc, char **argv)
 	if (fifo)
         av_audio_fifo_free(fifo);
 
+	 ao_shutdown();
+	
     return 0;
 }
